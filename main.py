@@ -13,7 +13,15 @@ model = genai.GenerativeModel("gemini-2.0-flash-lite")
 
 # --- 職能與員工設定 ---
 ROLES = ["前台", "外場", "吧台", "廚師", "管理"]
-SHIFT_TYPES = ["早班", "午班", "晚班", "大夜班"]
+
+# --- 班別詳細資訊 (包含時間) ---
+SHIFT_DETAILS = {
+    "早班": {"start": "08:00", "end": "16:00", "duration": 8},
+    "午班": {"start": "12:00", "end": "20:00", "duration": 8},
+    "晚班": {"start": "16:00", "end": "00:00", "duration": 8}, # 跨日班別
+    "大夜班": {"start": "00:00", "end": "08:00", "duration": 8}, # 跨日班別
+}
+SHIFT_TYPES = list(SHIFT_DETAILS.keys())
 
 # --- 特殊日期設定 ---
 # 國定假日 (範例：2025年7月4日)
@@ -101,7 +109,7 @@ print("詳細的員工職能與限制已寫入 employee_constraints.txt 檔案�
 
 
 # --- 共用函式 ---
-def calculate_fairness_score(emp, stats, day_type, shift):
+def calculate_fairness_score(emp, stats, day_type, shift, worked_yesterday=False):
     """計算員工的公平性分數 (V2)"""
     score = stats[emp]["total_shifts"] * 0.1
     if day_type == "weekend":
@@ -111,6 +119,11 @@ def calculate_fairness_score(emp, stats, day_type, shift):
     # 新增：考慮各職能的分配公平性
     for role in ROLES:
         score += stats[emp]["role_counts"][role] * 0.2
+    
+    # 新增：鼓勵連續上班，降低上班日不連續的情況
+    if worked_yesterday:
+        score -= 0.05 # 給予一個小的分數獎勵，使其更可能被排班
+
     return score
 
 def get_consecutive_work_days(employee, current_date, schedule):
@@ -166,6 +179,32 @@ def get_work_days_in_period(employee, current_date, schedule, period_days):
             work_days += 1
     return work_days
 
+def get_datetime_from_shift_time(date_obj, time_str, is_end_time=False):
+    """將時間字串轉換為 datetime 物件，並處理跨日情況。"""
+    hour, minute = map(int, time_str.split(":"))
+    dt_obj = datetime(date_obj.year, date_obj.month, date_obj.day, hour, minute)
+    # 如果是結束時間且小於開始時間 (表示跨日)，則加一天
+    if is_end_time and (hour < 8 or (hour == 8 and minute == 0)) and time_str != "08:00": # 假設最早班是8點，避免誤判
+        dt_obj += timedelta(days=1)
+    return dt_obj
+
+def get_weekly_work_hours(employee, current_date, schedule, shift_details):
+    """計算員工在指定日期所屬週內的總工時 (週一為一週的開始)。"""
+    total_hours = 0
+    # 找到本週的開始日期 (週一)
+    start_of_week = current_date - timedelta(days=current_date.weekday())
+
+    for i in range(7): # 檢查一週內的每一天
+        check_date = start_of_week + timedelta(days=i)
+        check_date_str = check_date.strftime("%Y-%m-%d")
+
+        if check_date_str in schedule:
+            for shift_type, roles_assigned in schedule[check_date_str].items():
+                for role, employees_assigned in roles_assigned.items():
+                    if employee in employees_assigned and "休" not in employees_assigned: # 確保不是休假
+                        total_hours += shift_details[shift_type]["duration"]
+    return total_hours
+
 
 # --- 步驟 1: LLM 解析請求 (與 V1 相同) ---
 def parse_requests_with_llm(raw_requests_text):
@@ -208,6 +247,9 @@ def create_schedule(start_date, end_date, leave_requests):
             "weekend_shifts": 0,
             "shift_counts": {st: 0 for st in SHIFT_TYPES},
             "role_counts": {r: 0 for r in ROLES},
+            "daily_hours": {}, # 新增：追蹤每日工時 {date_str: hours}
+            "weekly_hours": 0, # 新增：追蹤每週工時
+            "last_shift_end_time": None, # 新增：追蹤上次班別結束時間 (datetime object)
         }
         for emp in EMPLOYEE_NAMES
     }
@@ -257,6 +299,12 @@ def create_schedule(start_date, end_date, leave_requests):
                     stats[emp_name]["shift_counts"][fixed_shift] += 1
                     if current_date.weekday() >= 5: # 判斷是否為週末
                         stats[emp_name]["weekend_shifts"] += 1
+                    
+                    # 更新工時和上次班別結束時間
+                    shift_duration = SHIFT_DETAILS[fixed_shift]["duration"]
+                    stats[emp_name]["daily_hours"][date_str] = stats[emp_name]["daily_hours"].get(date_str, 0) + shift_duration
+                    stats[emp_name]["weekly_hours"] = get_weekly_work_hours(emp_name, current_date, schedule, SHIFT_DETAILS)
+                    stats[emp_name]["last_shift_end_time"] = get_datetime_from_shift_time(current_date, SHIFT_DETAILS[fixed_shift]["end"], is_end_time=True)
             else:
                 # 如果固定班員工請假，則在排班表中標記為「休」
                 for shift in SHIFT_TYPES:
@@ -266,14 +314,14 @@ def create_schedule(start_date, end_date, leave_requests):
                 # 確保請假員工在當天不會被排班
                 schedule[date_str][fixed_shift][fixed_role].append("休")
 
-        # 取得前一天的排班資訊，用於「大夜班隔天不能上早班」規則
-        previous_date = current_date - timedelta(days=1)
-        previous_date_str = previous_date.strftime("%Y-%m-%d")
-        employees_who_worked_night_shift_yesterday = set()
-        if previous_date_str in schedule:
-            night_shift_roles_prev_day = schedule[previous_date_str].get("大夜班", {})
-            for role_employees in night_shift_roles_prev_day.values():
-                employees_who_worked_night_shift_yesterday.update(role_employees)
+        # 移除舊的「大夜班隔天不能上早班」規則，因為11小時休息規則將涵蓋它
+        # previous_date = current_date - timedelta(days=1)
+        # previous_date_str = previous_date.strftime("%Y-%m-%d")
+        # employees_who_worked_night_shift_yesterday = set()
+        # if previous_date_str in schedule:
+        #     night_shift_roles_prev_day = schedule[previous_date_str].get("大夜班", {})
+        #     for role_employees in night_shift_roles_prev_day.values():
+        #         employees_who_worked_night_shift_yesterday.update(role_employees)
 
         for shift, role_reqs in requirements_today.items():
             for role, count in role_reqs.items():
@@ -288,23 +336,41 @@ def create_schedule(start_date, end_date, leave_requests):
                         and shift
                         in EMPLOYEE_CONSTRAINTS.get(emp, SHIFT_TYPES)  # 時間限制
                         and role in EMPLOYEES[emp]["roles"]  # 職能限制
-                        # 新增規則: 大夜班隔天不能上早班
-                        and not (shift == "早班" and emp in employees_who_worked_night_shift_yesterday)
                         # 新增規則: 不能連續上班6天 (即最多連續上班5天)
                         and get_consecutive_work_days(emp, current_date, schedule) < 5
                         # 新增規則: 雙周一定要休兩天假 (即14天內最多上班12天)
                         and get_work_days_in_period(emp, current_date, schedule, 14) < 12
+                        # 新增規則: 每日工時不能超過8小時
+                        and (stats[emp]["daily_hours"].get(date_str, 0) + SHIFT_DETAILS[shift]["duration"] <= 8)
+                        # 新增規則: 每週工時不能超過40小時
+                        and (get_weekly_work_hours(emp, current_date, schedule, SHIFT_DETAILS) + SHIFT_DETAILS[shift]["duration"] <= 40)
+                        # 新增規則: 輪班間隔不能少於11小時
+                        and (stats[emp]["last_shift_end_time"] is None or 
+                             (get_datetime_from_shift_time(current_date, SHIFT_DETAILS[shift]["start"]) - stats[emp]["last_shift_end_time"]).total_seconds() / 3600 >= 11)
                     ]
 
                     if not available_employees:
                         schedule[date_str][shift][role].append("!!人力不足!!")
                         continue
 
-                    # 計算所有可用員工的公平性分數
-                    employee_scores = [
-                        (emp, calculate_fairness_score(emp, stats, day_type, shift))
-                        for emp in available_employees
-                    ]
+                    # 取得前一天的排班資訊，用於判斷是否連續上班
+                    previous_date = current_date - timedelta(days=1)
+                    previous_date_str = previous_date.strftime("%Y-%m-%d")
+                    
+                    # 找出最適合的員工
+                    employee_scores = []
+                    for emp in available_employees:
+                        worked_yesterday = False
+                        if previous_date_str in schedule:
+                            for prev_shift_data in schedule[previous_date_str].values():
+                                for prev_role_employees in prev_shift_data.values():
+                                    if emp in prev_role_employees and "休" not in prev_role_employees:
+                                        worked_yesterday = True
+                                        break
+                                if worked_yesterday:
+                                    break
+                        score = calculate_fairness_score(emp, stats, day_type, shift, worked_yesterday=worked_yesterday)
+                        employee_scores.append((emp, score))
 
                     # 找出最低分數
                     min_score = min(employee_scores, key=lambda x: x[1])[1]
@@ -325,6 +391,12 @@ def create_schedule(start_date, end_date, leave_requests):
                     stats[best_employee]["shift_counts"][shift] += 1
                     if day_type == "weekend":
                         stats[best_employee]["weekend_shifts"] += 1
+                    
+                    # 更新工時和上次班別結束時間
+                    shift_duration = SHIFT_DETAILS[shift]["duration"]
+                    stats[best_employee]["daily_hours"][date_str] = stats[best_employee]["daily_hours"].get(date_str, 0) + shift_duration
+                    stats[best_employee]["weekly_hours"] = get_weekly_work_hours(best_employee, current_date, schedule, SHIFT_DETAILS)
+                    stats[best_employee]["last_shift_end_time"] = get_datetime_from_shift_time(current_date, SHIFT_DETAILS[shift]["end"], is_end_time=True)
 
     print("排班演算法完成！")
     return schedule, stats, leave_map
