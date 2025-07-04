@@ -15,6 +15,13 @@ model = genai.GenerativeModel("gemini-2.0-flash-lite")
 ROLES = ["前台", "外場", "吧台", "廚師", "管理"]
 SHIFT_TYPES = ["早班", "午班", "晚班", "大夜班"]
 
+# --- 特殊日期設定 ---
+# 國定假日 (範例：2025年7月4日)
+HOLIDAYS = [date(2025, 7, 4)]
+# 不營業日 (範例：2025年7月7日)
+NON_BUSINESS_DAYS = [date(2025, 7, 7)]
+
+
 
 def generate_employees(num_employees=100):
     """產生具備隨機職能的員工資料"""
@@ -30,6 +37,28 @@ def generate_employees(num_employees=100):
 
 EMPLOYEES = generate_employees(100)
 EMPLOYEE_NAMES = list(EMPLOYEES.keys())
+
+# --- 固定班員工設定 ---
+# 範例：設定員工1、員工2、員工3為固定班
+FIXED_SHIFT_EMPLOYEES = {
+    "員工1": {"shift": "早班", "role": "前台"},
+    "員工2": {"shift": "午班", "role": "外場"},
+    "員工3": {"shift": "晚班", "role": "廚師"},
+}
+
+# 更新 EMPLOYEE_NAMES 和 EMPLOYEES 字典，標記固定班員工
+FIXED_SHIFT_EMPLOYEE_NAMES = list(FIXED_SHIFT_EMPLOYEES.keys())
+for emp_name, details in FIXED_SHIFT_EMPLOYEES.items():
+    if emp_name in EMPLOYEES:
+        EMPLOYEES[emp_name]["is_fixed_shift"] = True
+        EMPLOYEES[emp_name]["fixed_shift_type"] = details["shift"]
+        # 確保固定班員工擁有其固定班的職能
+        if details["role"] not in EMPLOYEES[emp_name]["roles"]:
+            EMPLOYEES[emp_name]["roles"].append(details["role"])
+    else:
+        print(f"警告：固定班員工 {emp_name} 不存在於總員工列表中，已忽略設定。")
+
+print(f"已設定 {len(FIXED_SHIFT_EMPLOYEES)} 位員工為固定班。")
 
 # --- 班別與人力需求設定 ---
 SHIFTS_PER_DAY_REQUIREMENTS = {
@@ -83,6 +112,59 @@ def calculate_fairness_score(emp, stats, day_type, shift):
     for role in ROLES:
         score += stats[emp]["role_counts"][role] * 0.2
     return score
+
+def get_consecutive_work_days(employee, current_date, schedule):
+    """計算員工在指定日期前連續上班的天數。"""
+    consecutive_days = 0
+    temp_date = current_date - timedelta(days=1)
+    while True:
+        date_str = temp_date.strftime("%Y-%m-%d")
+        # 檢查日期是否在排班範圍內，並且該日期已經被處理過
+        if date_str not in schedule:
+            break
+
+        worked_on_temp_date = False
+        # 檢查員工是否在當天有任何班次
+        for shift_data in schedule[date_str].values():
+            for role_employees in shift_data.values():
+                # 確保員工被排班且不是因為國定假日或不營業日而標記的「休」
+                if employee in role_employees and "休" not in role_employees:
+                    worked_on_temp_date = True
+                    break
+            if worked_on_temp_date:
+                break
+
+        if worked_on_temp_date:
+            consecutive_days += 1
+            temp_date -= timedelta(days=1)
+        else:
+            break  # 找到一天休息日，連續上班中斷
+
+    return consecutive_days
+
+def get_work_days_in_period(employee, current_date, schedule, period_days):
+    """計算員工在指定日期前一個週期內 (period_days) 的上班天數。"""
+    work_days = 0
+    for i in range(period_days):
+        check_date = current_date - timedelta(days=i)
+        check_date_str = check_date.strftime("%Y-%m-%d")
+
+        if check_date_str not in schedule:
+            # 如果日期超出排班範圍，則停止檢查
+            break
+
+        worked_on_check_date = False
+        for shift_data in schedule[check_date_str].values():
+            for role_employees in shift_data.values():
+                if employee in role_employees and "休" not in role_employees:
+                    worked_on_check_date = True
+                    break
+            if worked_on_check_date:
+                break
+
+        if worked_on_check_date:
+            work_days += 1
+    return work_days
 
 
 # --- 步驟 1: LLM 解析請求 (與 V1 相同) ---
@@ -141,12 +223,57 @@ def create_schedule(start_date, end_date, leave_requests):
         date_str = current_date.strftime("%Y-%m-%d")
         schedule[date_str] = {st: {r: [] for r in ROLES} for st in SHIFT_TYPES}
 
+        # 檢查是否為國定假日或不營業日
+        if current_date in HOLIDAYS or current_date in NON_BUSINESS_DAYS:
+            for shift in SHIFT_TYPES:
+                for role in ROLES:
+                    schedule[date_str][shift][role].append("休")  # 標記為休假
+            # 將所有員工加入當天的請假列表，確保他們不會被排班
+            for emp in EMPLOYEE_NAMES:
+                leave_map.setdefault(date_str, set()).add(emp)
+            continue  # 跳過當天的排班邏輯
+
         day_type = "weekend" if current_date.weekday() >= 5 else "weekday"
         requirements_today = SHIFTS_PER_DAY_REQUIREMENTS[day_type]
         on_leave_today = leave_map.get(date_str, set())
 
         # 一天內已排班的人員集合，避免重複排班
         assigned_today_flat = set()
+
+        # --- 處理固定班員工 ---
+        for emp_name in FIXED_SHIFT_EMPLOYEE_NAMES:
+            if emp_name not in on_leave_today: # ��果員工沒有請假
+                fixed_shift = EMPLOYEES[emp_name]["fixed_shift_type"]
+                fixed_role = FIXED_SHIFT_EMPLOYEES[emp_name]["role"]
+                
+                # 確保固定班員工的職能符合其固定班別的需求
+                if fixed_role in ROLES and fixed_shift in SHIFT_TYPES:
+                    schedule[date_str][fixed_shift][fixed_role].append(emp_name)
+                    assigned_today_flat.add(emp_name) # 將固定班員工加入已排班列表
+                    
+                    # 更新統計數據
+                    stats[emp_name]["total_shifts"] += 1
+                    stats[emp_name]["role_counts"][fixed_role] += 1
+                    stats[emp_name]["shift_counts"][fixed_shift] += 1
+                    if current_date.weekday() >= 5: # 判斷是否為週末
+                        stats[emp_name]["weekend_shifts"] += 1
+            else:
+                # 如果固定班員工請假，則在排班表中標記為「休」
+                for shift in SHIFT_TYPES:
+                    for role in ROLES:
+                        if emp_name in schedule[date_str][shift][role]:
+                            schedule[date_str][shift][role].remove(emp_name)
+                # 確保請假員工在當天不會被排班
+                schedule[date_str][fixed_shift][fixed_role].append("休")
+
+        # 取得前一天的排班資訊，用於「大夜班隔天不能上早班」規則
+        previous_date = current_date - timedelta(days=1)
+        previous_date_str = previous_date.strftime("%Y-%m-%d")
+        employees_who_worked_night_shift_yesterday = set()
+        if previous_date_str in schedule:
+            night_shift_roles_prev_day = schedule[previous_date_str].get("大夜班", {})
+            for role_employees in night_shift_roles_prev_day.values():
+                employees_who_worked_night_shift_yesterday.update(role_employees)
 
         for shift, role_reqs in requirements_today.items():
             for role, count in role_reqs.items():
@@ -157,22 +284,38 @@ def create_schedule(start_date, end_date, leave_requests):
                         for emp in EMPLOYEE_NAMES
                         if emp not in on_leave_today
                         and emp not in assigned_today_flat
+                        and emp not in FIXED_SHIFT_EMPLOYEE_NAMES # 排除固定班員工
                         and shift
                         in EMPLOYEE_CONSTRAINTS.get(emp, SHIFT_TYPES)  # 時間限制
                         and role in EMPLOYEES[emp]["roles"]  # 職能限制
+                        # 新增規則: 大夜班隔天不能上早班
+                        and not (shift == "早班" and emp in employees_who_worked_night_shift_yesterday)
+                        # 新增規則: 不能連續上班6天 (即最多連續上班5天)
+                        and get_consecutive_work_days(emp, current_date, schedule) < 5
+                        # 新增規則: 雙周一定要休兩天假 (即14天內最多上班12天)
+                        and get_work_days_in_period(emp, current_date, schedule, 14) < 12
                     ]
 
                     if not available_employees:
                         schedule[date_str][shift][role].append("!!人力不足!!")
                         continue
 
-                    # 找出最適合的員工
-                    best_employee = min(
-                        available_employees,
-                        key=lambda emp: calculate_fairness_score(
-                            emp, stats, day_type, shift
-                        ),
-                    )
+                    # 計算所有可用員工的公平性分數
+                    employee_scores = [
+                        (emp, calculate_fairness_score(emp, stats, day_type, shift))
+                        for emp in available_employees
+                    ]
+
+                    # 找出最低分數
+                    min_score = min(employee_scores, key=lambda x: x[1])[1]
+
+                    # 收集所有達到最低分數的員工
+                    best_employees_candidates = [
+                        emp for emp, score in employee_scores if score == min_score
+                    ]
+
+                    # 從最佳候選人中隨機選擇一位
+                    best_employee = random.choice(best_employees_candidates)
 
                     # 分派並更新數據
                     schedule[date_str][shift][role].append(best_employee)
@@ -312,6 +455,7 @@ def export_to_excel(schedule, leave_map, filename="shift_schedule.xlsx"):
     # --- 樣式設定 ---
     center_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     bold_font = Font(bold=True)
+    red_font = Font(color="FF0000", bold=True) # Added red_font definition
     leave_font = Font(color="FF0000", bold=True)
     leave_fill = PatternFill(
         start_color="FFFF00", end_color="FFFF00", fill_type="solid"
@@ -335,6 +479,10 @@ def export_to_excel(schedule, leave_map, filename="shift_schedule.xlsx"):
         cell = summary_sheet.cell(row=1, column=col, value=date)
         cell.font = bold_font
         cell.alignment = center_alignment
+        # 判斷是否為六日，並設定紅色字體
+        date_obj = datetime.strptime(date, "%Y-%m-%d").date()
+        if date_obj.weekday() >= 5:
+            cell.font = red_font
         cell.border = thin_border
 
     # 寫入員工列表及班表內容
